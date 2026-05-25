@@ -12,5 +12,10 @@ logging.basicConfig(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--dry-run", action="store_true", help="Log only, push nothing")
     args = parser.parse_args()
-    run_scan(load_config(args.config))
+
+    cfg = load_config(args.config)
+    if args.dry_run:
+        cfg.setdefault("scanner", {})["dry_run"] = True
+    run_scan(cfg)
