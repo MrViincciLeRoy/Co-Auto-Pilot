@@ -25,11 +25,57 @@ def _fix_readme(text: str) -> str:
     return text.strip()
 
 
+def _extract_via_regex(raw: str) -> dict:
+    """
+    Fallback parser when json.loads fails.
+    Pulls description and readme directly using regex so unescaped
+    characters inside the readme value don't break the whole parse.
+    """
+    result = {}
+
+    desc_match = re.search(r'"description"\s*:\s*"(.*?)"(?=\s*,|\s*})', raw, re.DOTALL)
+    if desc_match:
+        result["description"] = desc_match.group(1).strip()
+
+    # Find where "readme" value starts and grab everything to the end of the JSON blob
+    readme_match = re.search(r'"readme"\s*:\s*"(.*)', raw, re.DOTALL)
+    if readme_match:
+        readme_raw = readme_match.group(1)
+        # Strip trailing JSON close — walk back from end to find the last unescaped "
+        # that closes the readme value
+        cleaned = []
+        i = 0
+        while i < len(readme_raw):
+            ch = readme_raw[i]
+            if ch == "\\" and i + 1 < len(readme_raw):
+                next_ch = readme_raw[i + 1]
+                if next_ch == "n":
+                    cleaned.append("\n")
+                elif next_ch == "t":
+                    cleaned.append("\t")
+                elif next_ch == '"':
+                    cleaned.append('"')
+                elif next_ch == "\\":
+                    cleaned.append("\\")
+                else:
+                    cleaned.append(next_ch)
+                i += 2
+                continue
+            # Unescaped quote = end of JSON string value
+            if ch == '"':
+                break
+            cleaned.append(ch)
+            i += 1
+        result["readme"] = "".join(cleaned).strip()
+
+    return result
+
+
 def _parse_response(raw: str) -> dict:
     if not raw:
         raise ValueError("AI returned empty response")
 
-    # Strip markdown fences if present
+    # Strip markdown fences
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
@@ -37,18 +83,32 @@ def _parse_response(raw: str) -> dict:
     if not raw:
         raise ValueError("AI returned empty response after stripping fences")
 
+    # Try clean JSON parse first
     try:
         result = json.loads(raw)
+        if "readme" in result:
+            result["readme"] = _fix_readme(result["readme"])
+        return result
     except json.JSONDecodeError:
-        cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
-        try:
-            result = json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            log.warning(f"        raw response (first 500 chars): {raw[:500]}")
-            raise e
+        pass
 
-    if "readme" in result:
-        result["readme"] = _fix_readme(result["readme"])
+    # Try fixing unescaped backslashes
+    try:
+        cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+        result = json.loads(cleaned)
+        if "readme" in result:
+            result["readme"] = _fix_readme(result["readme"])
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: regex extraction — handles unterminated strings / unescaped backticks
+    log.warning("        JSON parse failed — falling back to regex extraction")
+    result = _extract_via_regex(raw)
+
+    if not result.get("description") and not result.get("readme"):
+        log.warning(f"        raw response (first 500 chars): {raw[:500]}")
+        raise ValueError("Could not extract any content from AI response")
 
     return result
 
@@ -74,10 +134,13 @@ Return ONLY valid JSON — no markdown fences, no preamble — shaped exactly li
 }}
 
 Rules:
-- The readme value must be a valid JSON string with real newlines escaped as \\n
-- Use proper markdown: # headings, ## sections, ``` code blocks, bullet lists with -
-- Include: project name, what it does, key features, tech stack, installation, usage, env vars
-- Do not include the outer JSON structure inside the readme value itself"""
+- The readme value must be a valid JSON string
+- Escape ALL double quotes inside the readme as \\"
+- Escape ALL backslashes as \\\\
+- Use \\n for newlines — do NOT use literal newlines inside the JSON string value
+- Use proper markdown: # headings, ## sections, bullet lists with -
+- For code blocks use \\n```\\n instead of literal backtick fences
+- Include: project name, what it does, key features, tech stack, installation, usage, env vars"""
 
     try:
         raw = ai.generate(prompt).strip()
