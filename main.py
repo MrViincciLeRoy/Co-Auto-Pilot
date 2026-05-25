@@ -85,9 +85,13 @@ class AIClient:
 
         elif self.provider == "groq":
             from groq import Groq
-            self.groq = Groq(api_key=cfg["ai"]["groq_api_key"])
+            self.groq       = Groq(api_key=cfg["ai"]["groq_api_key"])
             self.model_name = cfg["ai"].get("groq_model", "llama-3.3-70b-versatile")
-            log.info(f"AI: Groq · {self.model_name}")
+            # Stay safely under the 30 RPM free-tier limit.
+            # groq_rpm: 25  →  60/25 = 2.4s minimum gap between calls.
+            rpm              = cfg["ai"].get("groq_rpm", 25)
+            self._groq_delay = 60.0 / rpm
+            log.info(f"AI: Groq · {self.model_name} · {rpm} RPM (delay {self._groq_delay:.1f}s)")
 
         else:
             raise ValueError(f"Unknown AI provider '{self.provider}' — use gemini or groq")
@@ -98,13 +102,29 @@ class AIClient:
             return resp.text
 
         elif self.provider == "groq":
-            resp = self.groq.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.3,
-            )
-            return resp.choices[0].message.content
+            max_retries = 4
+            for attempt in range(max_retries):
+                try:
+                    resp = self.groq.chat.completions.create(
+                        model=self.model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=2000,
+                        temperature=0.3,
+                    )
+                    # Enforce minimum gap between requests regardless of how
+                    # fast the model responds — keeps us under the RPM cap.
+                    time.sleep(self._groq_delay)
+                    return resp.choices[0].message.content
+
+                except Exception as e:
+                    err = str(e).lower()
+                    is_rate_limit = "rate_limit" in err or "429" in err or "too many" in err
+                    if is_rate_limit and attempt < max_retries - 1:
+                        wait = 10 * (2 ** attempt)   # 10s → 20s → 40s
+                        log.warning(f"Groq rate limit hit — waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait)
+                    else:
+                        raise
 
 
 # ── Repo state checks ─────────────────────────────────────────────────────────
@@ -362,10 +382,15 @@ def run_scan(cfg: dict):
     if not token:
         raise SystemExit("No GitHub token — set SCANNER_GITHUB_TOKEN env var or config.yaml")
 
-    gh       = Github(token)
+    from github import Auth
+    gh       = Github(auth=Auth.Token(token))
     ai       = AIClient(cfg)
-    username = gh_cfg.get("username")
-    user     = gh.get_user(username) if username else gh.get_user()
+    username = gh_cfg.get("username", "").strip()
+    # Fall back to the authenticated token owner if username is blank or still a placeholder
+    if username and username != "your_github_username":
+        user = gh.get_user(username)
+    else:
+        user = gh.get_user()
     repos    = list(user.get_repos(type="owner"))
 
     skip_forks = cfg.get("scanner", {}).get("skip_forks", True)
@@ -373,6 +398,7 @@ def run_scan(cfg: dict):
 
     for repo in repos:
         if skip_forks and repo.fork:
+            log.info(f"  SKIP  {repo.name:<35}  forked from {repo.parent.full_name if repo.parent else 'unknown'}")
             continue
         try:
             process_repo(repo, ai, cfg)
