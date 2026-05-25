@@ -373,7 +373,6 @@ def run_scan(cfg: dict):
 
     for repo in repos:
         if skip_forks and repo.fork:
-            log.info(f"  SKIP  {repo.name:<35}  forked from {repo.parent.full_name if repo.parent else 'unknown'}")
             continue
         try:
             process_repo(repo, ai, cfg)
