@@ -1,4 +1,6 @@
 import os
+import re
+import sys
 import json
 import time
 import logging
@@ -44,9 +46,155 @@ PRIORITY_FILES = {
     "index.html", "main.go", "main.rs", "main.java",
 }
 
-# Groq's free tier context limit — stay comfortably under it
-GROQ_MAX_PROMPT_CHARS = 28_000
+# Groq free-tier limits:
+#   TPM  = 12,000 tokens/min
+#   We reserve 2,000 for output → input budget = 10,000 tokens
+#   Code averages ~2.5 chars/token, so 10,000 * 2.5 = 25,000 chars max.
+#   We use 16,000 to leave a generous safety margin and account for denser code.
+GROQ_MAX_PROMPT_CHARS = 16_000
 
+# Conservative TPM ceiling we self-enforce (actual limit is 12,000)
+GROQ_TPM_BUDGET = 9_500
+
+# How many rate-limit hits a single key gets before it's marked dead
+KEY_RATE_LIMIT_STRIKES = 3
+
+
+# ── Exceptions ───────────────────────────────────────────────────────────────
+
+class PayloadTooLargeError(Exception):
+    pass
+
+
+class AllKeysDead(Exception):
+    """Raised when every Groq key has been rate-limited to exhaustion."""
+    pass
+
+
+# ── Key slot ─────────────────────────────────────────────────────────────────
+
+class _KeySlot:
+    """Wraps one Groq client and tracks its rate-limit strike count."""
+
+    __slots__ = ("client", "label", "rl_hits", "dead")
+
+    def __init__(self, client, label: str):
+        self.client  = client
+        self.label   = label   # e.g. "key 1"
+        self.rl_hits = 0
+        self.dead    = False
+
+    def strike(self) -> bool:
+        """
+        Record one rate-limit hit.
+        Returns True the moment the key crosses the strike threshold and dies.
+        """
+        self.rl_hits += 1
+        if self.rl_hits >= KEY_RATE_LIMIT_STRIKES:
+            self.dead = True
+        return self.dead
+
+
+# ── Throttle ─────────────────────────────────────────────────────────────────
+
+def _parse_retry_after(err_str: str) -> float:
+    """
+    Extract the suggested wait from Groq rate-limit messages.
+    e.g. 'Please try again in 489.999ms' or 'try again in 1.5s'
+    Returns seconds as a float, or 0.0 if not found.
+    """
+    m = re.search(r'try again in ([\d.]+)\s*(ms|s)', err_str, re.IGNORECASE)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    return (val / 1000.0) if unit == "ms" else val
+
+
+class GroqThrottle:
+    """
+    Tracks token usage against the TPM window and enforces smart pacing so we
+    never hit the rate limiter in the first place — and recover gracefully when
+    we do.
+
+    Pacing rules:
+    - Before every request: check TPM budget; if low, wait for the window to roll.
+    - Between requests: enforce a minimum gap (60 / rpm seconds).
+    - After a heavy request (>5k tokens): add a proportional cooldown so the
+      model has time to breathe before we send the next prompt.
+    - After a 429: honour the parsed retry-after time plus a 5-second buffer;
+      if Groq didn't tell us how long, wait a full 60 seconds.
+    - After a 413 (payload too large): wait 10 seconds — the context was large
+      and the task may still be in flight on the model's side.
+    """
+
+    def __init__(self, rpm: int):
+        self._min_gap       = 60.0 / rpm
+        self._window_start  = time.monotonic()
+        self._window_tokens = 0
+        self._last_sent     = 0.0
+
+    def _reset_window_if_needed(self):
+        if time.monotonic() - self._window_start >= 60.0:
+            self._window_start  = time.monotonic()
+            self._window_tokens = 0
+
+    def before(self, estimated_tokens: int):
+        """Call once before each API request. Blocks until it's safe to send."""
+        self._reset_window_if_needed()
+
+        if self._window_tokens + estimated_tokens > GROQ_TPM_BUDGET:
+            wait = 60.0 - (time.monotonic() - self._window_start)
+            if wait > 0:
+                log.info(
+                    f"        TPM budget at {self._window_tokens:,}/{GROQ_TPM_BUDGET:,} tokens"
+                    f" — pausing {wait:.1f}s for window reset"
+                )
+                time.sleep(wait + 1.0)
+            self._window_start  = time.monotonic()
+            self._window_tokens = 0
+
+        gap = time.monotonic() - self._last_sent
+        if gap < self._min_gap:
+            time.sleep(self._min_gap - gap)
+
+    def after_success(self, tokens_used: int):
+        """Call after a successful response with the actual token count."""
+        self._last_sent      = time.monotonic()
+        self._window_tokens += tokens_used
+
+        if tokens_used > 5_000:
+            extra = min(tokens_used / 1_000.0, 10.0)
+            log.info(f"        heavy request ({tokens_used:,} tokens) — +{extra:.1f}s cooldown")
+            time.sleep(extra)
+
+    def after_rate_limit(self, err_str: str):
+        """
+        Called on a 429. Waits the server-suggested time plus a buffer so the
+        TPM window has fully reset before we try the next key.
+        """
+        parsed = _parse_retry_after(err_str)
+
+        if parsed and parsed < 30.0:
+            wait = parsed + 5.0
+        else:
+            wait = 60.0
+
+        log.warning(f"        waiting {wait:.1f}s before rotating to next key")
+        time.sleep(wait)
+
+        self._window_start  = time.monotonic()
+        self._window_tokens = 0
+        self._last_sent     = time.monotonic()
+
+    def after_payload_too_large(self):
+        """Called on a 413 — brief pause before the caller raises PayloadTooLargeError."""
+        log.warning("        payload too large — waiting 10s before continuing")
+        time.sleep(10.0)
+        self._last_sent = time.monotonic()
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
 
 def load_config(path="config.yaml"):
     with open(path) as f:
@@ -58,8 +206,8 @@ def load_config(path="config.yaml"):
     cfg["github"]["token"]      = os.getenv("SCANNER_GITHUB_TOKEN") or cfg["github"].get("token", "")
     cfg["ai"]["gemini_api_key"] = os.getenv("GEMINI_API_KEY") or cfg["ai"].get("gemini_api_key", "")
 
-    # Collect Groq keys from GROQ_API_KEY_1, GROQ_API_KEY_2, ... (no upper limit)
-    # Falls back to plain GROQ_API_KEY for single-key setups
+    # Collect Groq keys: GROQ_API_KEY_1, GROQ_API_KEY_2, ...
+    # Falls back to plain GROQ_API_KEY for single-key setups.
     groq_keys = []
     i = 1
     while True:
@@ -73,9 +221,17 @@ def load_config(path="config.yaml"):
         if single:
             groq_keys.append(single)
 
+    if cfg["ai"].get("provider", "groq").lower() == "groq" and not groq_keys:
+        raise SystemExit(
+            "No Groq API keys found — set GROQ_API_KEY_1 (and optionally _2, _3, ...) "
+            "in GitHub Actions secrets, or GROQ_API_KEY for local runs."
+        )
+
     cfg["ai"]["groq_keys"] = groq_keys
     return cfg
 
+
+# ── AI client ────────────────────────────────────────────────────────────────
 
 class AIClient:
     def __init__(self, cfg):
@@ -91,72 +247,111 @@ class AIClient:
         elif self.provider == "groq":
             from groq import Groq
             keys = cfg["ai"].get("groq_keys", [])
-            if not keys:
-                raise SystemExit("No Groq API keys found. Set GROQ_API_KEY_1 (and optionally _2, _3, ...) in secrets.")
 
-            self.model_name  = cfg["ai"].get("groq_model", "llama-3.3-70b-versatile")
-            rpm               = cfg["ai"].get("groq_rpm", 25)
-            self._groq_delay  = 60.0 / rpm
-            self._key_index   = 0
+            self.model_name = cfg["ai"].get("groq_model", "llama-3.3-70b-versatile")
+            rpm             = cfg["ai"].get("groq_rpm", 25)
 
-            # Build one Groq client per key
-            self._clients = [Groq(api_key=k) for k in keys]
+            self._slots     = [_KeySlot(Groq(api_key=k), f"key {i+1}") for i, k in enumerate(keys)]
+            self._cursor    = 0
+            self._throttle  = GroqThrottle(rpm)
+
             log.info(f"AI: Groq · {self.model_name} · {len(keys)} key(s) · {rpm} RPM")
 
         else:
-            raise ValueError(f"Unknown AI provider '{self.provider}' — use gemini or groq")
+            raise ValueError(f"Unknown AI provider '{self.provider}' — use groq or gemini")
 
-    def _next_groq_client(self):
-        client = self._clients[self._key_index % len(self._clients)]
-        self._key_index += 1
-        return client
+    # ── internal ─────────────────────────────────────────────────────────────
+
+    def _live_slots(self) -> list:
+        return [s for s in self._slots if not s.dead]
+
+    def _next_live_slot(self) -> _KeySlot:
+        live = self._live_slots()
+        if not live:
+            raise AllKeysDead(
+                f"All {len(self._slots)} Groq key(s) have been rate-limited "
+                f"{KEY_RATE_LIMIT_STRIKES} times each — stopping scan."
+            )
+        slot = live[self._cursor % len(live)]
+        self._cursor += 1
+        return slot
+
+    # ── public ───────────────────────────────────────────────────────────────
 
     def generate(self, prompt: str) -> str:
         if self.provider == "gemini":
             resp = self.model.generate_content(prompt)
             return resp.text
 
-        elif self.provider == "groq":
-            max_retries = len(self._clients) * 2  # give each key at least 2 chances
-            for attempt in range(max_retries):
-                client = self._next_groq_client()
-                try:
-                    resp = client.chat.completions.create(
-                        model=self.model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=2000,
-                        temperature=0.3,
-                    )
-                    time.sleep(self._groq_delay)
-                    return resp.choices[0].message.content
+        estimated_tokens = len(prompt) // 2
+        self._throttle.before(estimated_tokens)
 
-                except Exception as e:
-                    err = str(e).lower()
-                    is_payload_too_large = "413" in err or "payload too large" in err or "request too large" in err
-                    is_rate_limit        = "429" in err or "rate_limit" in err or "too many" in err
+        # Each key gets KEY_RATE_LIMIT_STRIKES attempts; total attempts bounded
+        # by keys × strikes. AllKeysDead breaks the loop early if they all die.
+        max_attempts = len(self._slots) * KEY_RATE_LIMIT_STRIKES
 
-                    if is_payload_too_large:
-                        # Rotating keys won't help — the prompt itself is too big.
-                        # Caller must truncate and retry with a shorter prompt.
-                        raise PayloadTooLargeError("Prompt too large for Groq (413)")
+        for attempt in range(max_attempts):
+            slot = self._next_live_slot()   # raises AllKeysDead when none remain
+            try:
+                resp = slot.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=2000,
+                    temperature=0.3,
+                )
+                tokens_used = resp.usage.total_tokens if resp.usage else estimated_tokens
+                self._throttle.after_success(tokens_used)
+                return resp.choices[0].message.content
 
-                    if is_rate_limit:
-                        wait = 8 * (2 ** (attempt % 4))   # 8 → 16 → 32 → 64, then reset
+            except Exception as e:
+                err = str(e).lower()
+                is_payload_too_large = (
+                    "413" in err
+                    or "payload too large" in err
+                    or "request too large" in err
+                )
+                is_rate_limit = (
+                    "429" in err
+                    or "rate_limit" in err
+                    or "too many" in err
+                )
+
+                if is_payload_too_large:
+                    self._throttle.after_payload_too_large()
+                    raise PayloadTooLargeError("Prompt too large for Groq (413)")
+
+                if is_rate_limit:
+                    just_died = slot.strike()
+                    live_count = len(self._live_slots())
+
+                    if just_died:
                         log.warning(
-                            f"        rate limit on key {(self._key_index - 1) % len(self._clients) + 1} "
-                            f"— rotating + waiting {wait}s (attempt {attempt + 1}/{max_retries})"
+                            f"        {slot.label} hit rate limit "
+                            f"{KEY_RATE_LIMIT_STRIKES}/{KEY_RATE_LIMIT_STRIKES} times "
+                            f"— marked dead. {live_count} key(s) remaining."
                         )
-                        time.sleep(wait)
-                        continue
+                    else:
+                        log.warning(
+                            f"        {slot.label} rate limit "
+                            f"({slot.rl_hits}/{KEY_RATE_LIMIT_STRIKES} strikes) "
+                            f"— rotating. {live_count} key(s) still live."
+                        )
 
-                    raise  # anything else: bubble up immediately
+                    if live_count == 0:
+                        raise AllKeysDead(
+                            f"All {len(self._slots)} Groq key(s) exhausted "
+                            f"({KEY_RATE_LIMIT_STRIKES} rate-limit strikes each) — stopping scan."
+                        )
 
-            raise RuntimeError(f"Groq failed after {max_retries} attempts")
+                    self._throttle.after_rate_limit(str(e))
+                    continue
+
+                raise  # any other error: bubble up immediately
+
+        raise RuntimeError(f"Groq: exhausted {max_attempts} attempts without success")
 
 
-class PayloadTooLargeError(Exception):
-    pass
-
+# ── GitHub helpers ────────────────────────────────────────────────────────────
 
 def is_inactive(repo, inactive_days: int):
     try:
@@ -196,13 +391,6 @@ def _is_stub_readme(content: str, repo_name: str) -> bool:
 
 
 def get_readme_state(repo):
-    """
-    Returns:
-      ('missing', None)   — no README file at all
-      ('empty', sha)      — README exists but blank/whitespace
-      ('stub', sha)       — README has content but it's just a title/repo name
-      ('ok', sha)         — README exists and has real content
-    """
     for name in ("README.md", "readme.md", "Readme.md"):
         try:
             f = repo.get_contents(name)
@@ -217,9 +405,11 @@ def get_readme_state(repo):
     return "missing", None
 
 
+# ── File collection ───────────────────────────────────────────────────────────
+
 def collect_files(repo, cfg_scanner: dict):
     max_file_chars  = cfg_scanner.get("max_file_chars", 2500)
-    max_total_chars = cfg_scanner.get("max_total_chars", 50_000)
+    max_total_chars = cfg_scanner.get("max_total_chars", 14_000)
     max_file_kb     = cfg_scanner.get("max_file_size_kb", 60)
     max_files       = cfg_scanner.get("max_files", 40)
 
@@ -232,8 +422,7 @@ def collect_files(repo, cfg_scanner: dict):
 
         if total >= max_total_chars:
             return
-        file_count = len(files["priority"]) + len(files["normal"])
-        if file_count >= max_files:
+        if len(files["priority"]) + len(files["normal"]) >= max_files:
             return
 
         try:
@@ -244,8 +433,7 @@ def collect_files(repo, cfg_scanner: dict):
         for item in contents:
             if total >= max_total_chars:
                 break
-            file_count = len(files["priority"]) + len(files["normal"])
-            if file_count >= max_files:
+            if len(files["priority"]) + len(files["normal"]) >= max_files:
                 break
 
             if item.type == "dir":
@@ -258,10 +446,8 @@ def collect_files(repo, cfg_scanner: dict):
 
                 if ext in SKIP_EXTENSIONS:
                     continue
-
                 if item.size > max_file_kb * 1024:
                     skipped_large += 1
-                    log.debug(f"  skip large file: {item.path} ({item.size // 1024}KB)")
                     continue
 
                 if ext in CODE_EXTENSIONS:
@@ -292,27 +478,26 @@ def build_code_block(files: dict) -> str:
 
 
 def _truncate_prompt(code_block: str, limit: int) -> str:
-    """Hard-trim the code block so the full prompt fits under the Groq char limit."""
     if len(code_block) <= limit:
         return code_block
     truncated = code_block[:limit]
-    # Cut at last clean line boundary to avoid mid-line truncation
     last_nl = truncated.rfind("\n")
     if last_nl > limit * 0.8:
         truncated = truncated[:last_nl]
     return truncated + "\n\n# ... context trimmed to fit model limit"
 
 
+# ── AI analysis ───────────────────────────────────────────────────────────────
+
 def analyze_repo(ai: AIClient, repo_name: str, files: dict) -> dict:
     code_block = build_code_block(files)
 
-    # Reserve ~500 chars for the prompt wrapper itself
     prompt_limit = GROQ_MAX_PROMPT_CHARS - 500
     if len(code_block) > prompt_limit:
         log.warning(f"        context too large ({len(code_block):,} chars) — trimming to {prompt_limit:,}")
         code_block = _truncate_prompt(code_block, prompt_limit)
 
-    log.info(f"        sending {len(code_block):,} chars to {ai.provider}")
+    log.info(f"        sending {len(code_block):,} chars (~{len(code_block) // 2:,} tokens est.) to {ai.provider}")
 
     prompt = f"""You are analyzing a GitHub repository named "{repo_name}".
 
@@ -329,24 +514,24 @@ IMPORTANT: In the readme value, escape all backslashes as \\\\ and do not use ra
 
     try:
         raw = ai.generate(prompt).strip()
-    except PayloadTooLargeError:
-        # Shouldn't happen after pre-truncation, but handle defensively
-        log.error(f"        payload still too large after trimming — skipping")
+    except (PayloadTooLargeError, AllKeysDead):
+        raise   # let these propagate — caller handles them differently
+    except Exception as e:
+        log.error(f"        AI error: {e}")
         return {}
 
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
 
-    # Fix common JSON escape issues from model output before parsing
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Try cleaning up bad escape sequences
-        import re
         cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
         return json.loads(cleaned)
 
+
+# ── Repo processor ────────────────────────────────────────────────────────────
 
 def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
     s             = cfg.get("scanner", {})
@@ -360,7 +545,6 @@ def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
         if inactive is None:
             log.info(f"  SKIP  {repo.name:<35}  empty repo (no commits)")
             return False
-
         if not inactive:
             log.info(f"  SKIP  {repo.name:<35}  active ({last_dt.strftime('%Y-%m-%d')})")
             return False
@@ -413,6 +597,11 @@ def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
 
     try:
         result = analyze_repo(ai, repo.name, files)
+    except AllKeysDead:
+        raise   # must propagate — kills the whole scan
+    except PayloadTooLargeError:
+        log.error(f"        payload still too large after trimming — skipping repo")
+        return False
     except json.JSONDecodeError as e:
         log.error(f"        AI returned invalid JSON: {e}")
         return False
@@ -471,6 +660,34 @@ def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
     return updated
 
 
+# ── Main scan loop ────────────────────────────────────────────────────────────
+
+def _scan_repos(repos, ai, cfg, force_recent=False) -> int:
+    """
+    Iterates repos and calls process_repo on each.
+    Stops immediately and exits the process if all Groq keys die.
+    Returns count of repos updated.
+    """
+    updated = 0
+    for repo in repos:
+        skip_forks = cfg.get("scanner", {}).get("skip_forks", True)
+        if skip_forks and repo.fork:
+            log.info(f"  SKIP  {repo.name:<35}  forked")
+            continue
+        try:
+            if process_repo(repo, ai, cfg, force_recent=force_recent):
+                updated += 1
+        except AllKeysDead as e:
+            log.error("=" * 55)
+            log.error(f"FATAL: {e}")
+            log.error("Stopping scan — no live API keys remaining.")
+            log.error("=" * 55)
+            sys.exit(1)
+        except Exception as e:
+            log.error(f"  ERROR  {repo.name}: {e}")
+    return updated
+
+
 def run_scan(cfg: dict):
     log.info("=" * 55)
     log.info("Repo scanner — starting")
@@ -499,17 +716,7 @@ def run_scan(cfg: dict):
     log.info("-" * 55)
     log.info("Pass 1 — inactive repos (30+ days)")
 
-    inactive_updated = 0
-    for repo in repos:
-        if skip_forks and repo.fork:
-            log.info(f"  SKIP  {repo.name:<35}  forked")
-            continue
-        try:
-            if process_repo(repo, ai, cfg, force_recent=False):
-                inactive_updated += 1
-        except Exception as e:
-            log.error(f"  ERROR  {repo.name}: {e}")
-
+    inactive_updated = _scan_repos(repos, ai, cfg, force_recent=False)
     log.info(f"Pass 1 done — {inactive_updated} repo(s) updated")
 
     # ── Pass 2: recent repos (only if Pass 1 did nothing) ────────────────────
@@ -539,13 +746,8 @@ def run_scan(cfg: dict):
     recent.sort(key=lambda x: x[0])
     log.info(f"Recent repos to check: {len(recent)}")
 
-    recent_updated = 0
-    for last_dt, repo in recent:
-        try:
-            if process_repo(repo, ai, cfg, force_recent=True):
-                recent_updated += 1
-        except Exception as e:
-            log.error(f"  ERROR  {repo.name}: {e}")
+    recent_repos = [r for _, r in recent]
+    recent_updated = _scan_repos(recent_repos, ai, cfg, force_recent=True)
 
     log.info(f"Pass 2 done — {recent_updated} repo(s) updated")
     log.info("Scan complete.")
