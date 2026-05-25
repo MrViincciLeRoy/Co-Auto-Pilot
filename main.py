@@ -44,6 +44,9 @@ PRIORITY_FILES = {
     "index.html", "main.go", "main.rs", "main.java",
 }
 
+# Groq's free tier context limit — stay comfortably under it
+GROQ_MAX_PROMPT_CHARS = 28_000
+
 
 def load_config(path="config.yaml"):
     with open(path) as f:
@@ -53,9 +56,24 @@ def load_config(path="config.yaml"):
     cfg.setdefault("ai", {})
 
     cfg["github"]["token"]      = os.getenv("SCANNER_GITHUB_TOKEN") or cfg["github"].get("token", "")
-    cfg["ai"]["groq_api_key"]   = os.getenv("GROQ_API_KEY")         or cfg["ai"].get("groq_api_key", "")
-    cfg["ai"]["gemini_api_key"] = os.getenv("GEMINI_API_KEY")        or cfg["ai"].get("gemini_api_key", "")
+    cfg["ai"]["gemini_api_key"] = os.getenv("GEMINI_API_KEY") or cfg["ai"].get("gemini_api_key", "")
 
+    # Collect Groq keys from GROQ_API_KEY_1, GROQ_API_KEY_2, ... (no upper limit)
+    # Falls back to plain GROQ_API_KEY for single-key setups
+    groq_keys = []
+    i = 1
+    while True:
+        key = os.getenv(f"GROQ_API_KEY_{i}")
+        if not key:
+            break
+        groq_keys.append(key)
+        i += 1
+    if not groq_keys:
+        single = os.getenv("GROQ_API_KEY") or cfg["ai"].get("groq_api_key", "")
+        if single:
+            groq_keys.append(single)
+
+    cfg["ai"]["groq_keys"] = groq_keys
     return cfg
 
 
@@ -72,14 +90,26 @@ class AIClient:
 
         elif self.provider == "groq":
             from groq import Groq
-            self.groq       = Groq(api_key=cfg["ai"]["groq_api_key"])
-            self.model_name = cfg["ai"].get("groq_model", "llama-3.3-70b-versatile")
-            rpm              = cfg["ai"].get("groq_rpm", 25)
-            self._groq_delay = 60.0 / rpm
-            log.info(f"AI: Groq · {self.model_name} · {rpm} RPM (delay {self._groq_delay:.1f}s)")
+            keys = cfg["ai"].get("groq_keys", [])
+            if not keys:
+                raise SystemExit("No Groq API keys found. Set GROQ_API_KEY_1 (and optionally _2, _3, ...) in secrets.")
+
+            self.model_name  = cfg["ai"].get("groq_model", "llama-3.3-70b-versatile")
+            rpm               = cfg["ai"].get("groq_rpm", 25)
+            self._groq_delay  = 60.0 / rpm
+            self._key_index   = 0
+
+            # Build one Groq client per key
+            self._clients = [Groq(api_key=k) for k in keys]
+            log.info(f"AI: Groq · {self.model_name} · {len(keys)} key(s) · {rpm} RPM")
 
         else:
             raise ValueError(f"Unknown AI provider '{self.provider}' — use gemini or groq")
+
+    def _next_groq_client(self):
+        client = self._clients[self._key_index % len(self._clients)]
+        self._key_index += 1
+        return client
 
     def generate(self, prompt: str) -> str:
         if self.provider == "gemini":
@@ -87,10 +117,11 @@ class AIClient:
             return resp.text
 
         elif self.provider == "groq":
-            max_retries = 4
+            max_retries = len(self._clients) * 2  # give each key at least 2 chances
             for attempt in range(max_retries):
+                client = self._next_groq_client()
                 try:
-                    resp = self.groq.chat.completions.create(
+                    resp = client.chat.completions.create(
                         model=self.model_name,
                         messages=[{"role": "user", "content": prompt}],
                         max_tokens=2000,
@@ -101,13 +132,30 @@ class AIClient:
 
                 except Exception as e:
                     err = str(e).lower()
-                    is_rate_limit = "rate_limit" in err or "429" in err or "too many" in err
-                    if is_rate_limit and attempt < max_retries - 1:
-                        wait = 10 * (2 ** attempt)
-                        log.warning(f"Groq rate limit hit — waiting {wait}s (attempt {attempt + 1}/{max_retries})")
+                    is_payload_too_large = "413" in err or "payload too large" in err or "request too large" in err
+                    is_rate_limit        = "429" in err or "rate_limit" in err or "too many" in err
+
+                    if is_payload_too_large:
+                        # Rotating keys won't help — the prompt itself is too big.
+                        # Caller must truncate and retry with a shorter prompt.
+                        raise PayloadTooLargeError("Prompt too large for Groq (413)")
+
+                    if is_rate_limit:
+                        wait = 8 * (2 ** (attempt % 4))   # 8 → 16 → 32 → 64, then reset
+                        log.warning(
+                            f"        rate limit on key {(self._key_index - 1) % len(self._clients) + 1} "
+                            f"— rotating + waiting {wait}s (attempt {attempt + 1}/{max_retries})"
+                        )
                         time.sleep(wait)
-                    else:
-                        raise
+                        continue
+
+                    raise  # anything else: bubble up immediately
+
+            raise RuntimeError(f"Groq failed after {max_retries} attempts")
+
+
+class PayloadTooLargeError(Exception):
+    pass
 
 
 def is_inactive(repo, inactive_days: int):
@@ -125,38 +173,25 @@ def is_inactive(repo, inactive_days: int):
 
 
 def _is_stub_readme(content: str, repo_name: str) -> bool:
-    """
-    True if the README is essentially meaningless — just a title or repo name.
-    Checks both length (under 30 words) AND that it looks like a stub
-    (single heading, matches repo name, or is a single short line).
-    """
     stripped = content.strip()
     words = stripped.split()
-
     if len(words) >= 30:
-        return False  # long enough to be real content
+        return False
 
-    # Normalise for comparison: lowercase, drop hyphens/underscores
     def normalise(s):
         return s.lower().replace("-", "").replace("_", "").replace(" ", "")
 
     lines = [l.strip() for l in stripped.splitlines() if l.strip()]
     repo_norm = normalise(repo_name)
 
-    # Single line (possibly a markdown heading)
     if len(lines) <= 1:
         return True
-
-    # All non-empty lines are short and at least one matches the repo name
     all_short = all(len(l) < 60 for l in lines)
     any_matches_repo = any(repo_norm in normalise(l) for l in lines)
     if all_short and any_matches_repo:
         return True
-
-    # Looks like just headings (every line starts with #)
     if all(l.startswith("#") for l in lines):
         return True
-
     return False
 
 
@@ -164,7 +199,7 @@ def get_readme_state(repo):
     """
     Returns:
       ('missing', None)   — no README file at all
-      ('empty', sha)      — README exists but is blank/whitespace
+      ('empty', sha)      — README exists but blank/whitespace
       ('stub', sha)       — README has content but it's just a title/repo name
       ('ok', sha)         — README exists and has real content
     """
@@ -256,10 +291,28 @@ def build_code_block(files: dict) -> str:
     return "\n\n".join(f"### {path}\n```\n{content}\n```" for path, content in ordered)
 
 
+def _truncate_prompt(code_block: str, limit: int) -> str:
+    """Hard-trim the code block so the full prompt fits under the Groq char limit."""
+    if len(code_block) <= limit:
+        return code_block
+    truncated = code_block[:limit]
+    # Cut at last clean line boundary to avoid mid-line truncation
+    last_nl = truncated.rfind("\n")
+    if last_nl > limit * 0.8:
+        truncated = truncated[:last_nl]
+    return truncated + "\n\n# ... context trimmed to fit model limit"
+
+
 def analyze_repo(ai: AIClient, repo_name: str, files: dict) -> dict:
     code_block = build_code_block(files)
-    total_chars = len(code_block)
-    log.info(f"        sending {total_chars:,} chars to {ai.provider}")
+
+    # Reserve ~500 chars for the prompt wrapper itself
+    prompt_limit = GROQ_MAX_PROMPT_CHARS - 500
+    if len(code_block) > prompt_limit:
+        log.warning(f"        context too large ({len(code_block):,} chars) — trimming to {prompt_limit:,}")
+        code_block = _truncate_prompt(code_block, prompt_limit)
+
+    log.info(f"        sending {len(code_block):,} chars to {ai.provider}")
 
     prompt = f"""You are analyzing a GitHub repository named "{repo_name}".
 
@@ -271,22 +324,33 @@ Return ONLY valid JSON — no markdown fences, no preamble — shaped exactly li
   "readme": "Full markdown README content"
 }}
 
-The README must include: project name, what it does, key features, tech stack, installation, usage, and required env vars if any."""
+The README must include: project name, what it does, key features, tech stack, installation, usage, and required env vars if any.
+IMPORTANT: In the readme value, escape all backslashes as \\\\ and do not use raw backslashes."""
 
-    raw = ai.generate(prompt).strip()
+    try:
+        raw = ai.generate(prompt).strip()
+    except PayloadTooLargeError:
+        # Shouldn't happen after pre-truncation, but handle defensively
+        log.error(f"        payload still too large after trimming — skipping")
+        return {}
+
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
-    return json.loads(raw)
+
+    # Fix common JSON escape issues from model output before parsing
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Try cleaning up bad escape sequences
+        import re
+        cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+        return json.loads(cleaned)
 
 
 def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
-    """
-    Process a single repo. Returns True if any update was made.
-    force_recent=True skips the inactive check (used for the recent pass).
-    """
-    s       = cfg.get("scanner", {})
-    dry_run = s.get("dry_run", False)
+    s             = cfg.get("scanner", {})
+    dry_run       = s.get("dry_run", False)
     overwrite     = s.get("overwrite_readme", False)
     inactive_days = s.get("inactive_days", 30)
 
@@ -302,7 +366,6 @@ def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
             return False
 
         readme_state, readme_sha = get_readme_state(repo)
-        # stub README → force-rewrite README and sync description
         needs_desc   = not repo.description or readme_state == "stub"
         needs_readme = overwrite or readme_state in ("missing", "empty", "stub")
 
@@ -318,7 +381,6 @@ def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
         log.info(f"  SCAN  {repo.name}  (last commit {last_dt.strftime('%Y-%m-%d')}"
                  + (f" · {', '.join(reasons)}" if reasons else "") + ")")
     else:
-        # Recent pass — check what actually needs doing
         inactive, last_dt = is_inactive(repo, inactive_days)
         readme_state, readme_sha = get_readme_state(repo)
         needs_desc   = not repo.description or readme_state == "stub"
@@ -356,6 +418,9 @@ def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
         return False
     except Exception as e:
         log.error(f"        AI error: {e}")
+        return False
+
+    if not result:
         return False
 
     desc   = result.get("description", "")[:255]
@@ -424,32 +489,30 @@ def run_scan(cfg: dict):
     else:
         user = gh.get_user()
 
-    repos      = list(user.get_repos(type="owner"))
-    skip_forks = cfg.get("scanner", {}).get("skip_forks", True)
+    repos         = list(user.get_repos(type="owner"))
+    skip_forks    = cfg.get("scanner", {}).get("skip_forks", True)
     inactive_days = cfg.get("scanner", {}).get("inactive_days", 30)
 
     log.info(f"Repos: {len(repos)}  skip_forks={skip_forks}")
 
-    # ── Pass 1: inactive repos (30+ days) ────────────────────────────────────
+    # ── Pass 1: inactive repos ────────────────────────────────────────────────
     log.info("-" * 55)
-    log.info("Pass 1 — inactive repos")
+    log.info("Pass 1 — inactive repos (30+ days)")
 
     inactive_updated = 0
-
     for repo in repos:
         if skip_forks and repo.fork:
             log.info(f"  SKIP  {repo.name:<35}  forked")
             continue
         try:
-            did_update = process_repo(repo, ai, cfg, force_recent=False)
-            if did_update:
+            if process_repo(repo, ai, cfg, force_recent=False):
                 inactive_updated += 1
         except Exception as e:
             log.error(f"  ERROR  {repo.name}: {e}")
 
     log.info(f"Pass 1 done — {inactive_updated} repo(s) updated")
 
-    # ── Pass 2: recent repos (conditional) ───────────────────────────────────
+    # ── Pass 2: recent repos (only if Pass 1 did nothing) ────────────────────
     if inactive_updated > 0:
         log.info("-" * 55)
         log.info(f"Pass 2 — SKIPPED (Pass 1 updated {inactive_updated} repo(s))")
@@ -460,8 +523,6 @@ def run_scan(cfg: dict):
     log.info("Pass 2 — recent repos (oldest-first)")
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=inactive_days)
-
-    # Collect recent repos with their last-commit date, then sort oldest-first
     recent = []
     for repo in repos:
         if skip_forks and repo.fork:
@@ -469,20 +530,19 @@ def run_scan(cfg: dict):
         try:
             _, last_dt = is_inactive(repo, inactive_days)
             if last_dt is None:
-                continue  # empty repo
+                continue
             if last_dt >= cutoff:
                 recent.append((last_dt, repo))
         except Exception as e:
             log.error(f"  ERROR  {repo.name}: {e}")
 
-    recent.sort(key=lambda x: x[0])  # oldest commit date first
+    recent.sort(key=lambda x: x[0])
     log.info(f"Recent repos to check: {len(recent)}")
 
     recent_updated = 0
     for last_dt, repo in recent:
         try:
-            did_update = process_repo(repo, ai, cfg, force_recent=True)
-            if did_update:
+            if process_repo(repo, ai, cfg, force_recent=True):
                 recent_updated += 1
         except Exception as e:
             log.error(f"  ERROR  {repo.name}: {e}")
