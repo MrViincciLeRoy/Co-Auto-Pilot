@@ -1,0 +1,86 @@
+name: Repo Snapshot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyGithub
+        run: pip install PyGithub
+
+      - name: Run snapshot
+        env:
+          SCANNER_GITHUB_TOKEN: ${{ secrets.SCANNER_GITHUB_TOKEN }}
+        run: |
+          python - << 'PYEOF'
+          import os
+          import json
+          from datetime import timezone
+          from github import Github, Auth
+
+          token = os.environ["SCANNER_GITHUB_TOKEN"]
+          gh = Github(auth=Auth.Token(token))
+          user = gh.get_user()
+
+          repos = []
+          for repo in user.get_repos(type="owner"):
+              readme_preview = None
+              try:
+                  for name in ("README.md", "readme.md", "Readme.md"):
+                      try:
+                          f = repo.get_contents(name)
+                          content = f.decoded_content.decode("utf-8", errors="ignore").strip()
+                          readme_preview = content[:200] if content else None
+                          break
+                      except Exception:
+                          pass
+              except Exception:
+                  pass
+
+              last_commit = None
+              try:
+                  commits = repo.get_commits()
+                  if commits.totalCount > 0:
+                      dt = commits[0].commit.committer.date
+                      if dt.tzinfo is None:
+                          from datetime import timezone
+                          dt = dt.replace(tzinfo=timezone.utc)
+                      last_commit = dt.strftime("%Y-%m-%d")
+              except Exception:
+                  pass
+
+              repos.append({
+                  "name": repo.name,
+                  "description": repo.description or "",
+                  "url": repo.html_url,
+                  "private": repo.private,
+                  "fork": repo.fork,
+                  "language": repo.language or "",
+                  "stars": repo.stargazers_count,
+                  "last_commit": last_commit,
+                  "readme_preview": readme_preview,
+              })
+
+          repos.sort(key=lambda r: r["name"].lower())
+
+          with open("repo_snapshot.json", "w") as f:
+              json.dump({"owner": user.login, "total": len(repos), "repos": repos}, f, indent=2)
+
+          print(f"Snapshot done — {len(repos)} repos")
+          PYEOF
+
+      - name: Upload snapshot as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-snapshot
+          path: repo_snapshot.json
+          retention-days: 30
