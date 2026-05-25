@@ -14,8 +14,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── File filtering ────────────────────────────────────────────────────────────
-
 CODE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".html", ".htm", ".vue", ".svelte",
@@ -28,15 +26,9 @@ CODE_EXTENSIONS = {
     ".yaml", ".yml",
 }
 
-# Always skip these regardless of size — notebooks, minified, lock files, maps
 SKIP_EXTENSIONS = {
-    ".ipynb",       # Colab / Jupyter — JSON blobs, can be 10MB+
-    ".lock",        # yarn.lock, poetry.lock, Pipfile.lock
-    ".map",         # JS source maps
-    ".min.js",      # minified JS
-    ".min.css",     # minified CSS
-    ".pyc",         # compiled Python
-    ".wasm",        # WebAssembly
+    ".ipynb", ".lock", ".map", ".min.js", ".min.css",
+    ".pyc", ".wasm",
 }
 
 IGNORE_DIRS = {
@@ -53,13 +45,10 @@ PRIORITY_FILES = {
 }
 
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
 def load_config(path="config.yaml"):
     with open(path) as f:
         cfg = yaml.safe_load(f)
 
-    # Env vars take priority — safe for GitHub Actions secrets
     cfg.setdefault("github", {})
     cfg.setdefault("ai", {})
 
@@ -69,8 +58,6 @@ def load_config(path="config.yaml"):
 
     return cfg
 
-
-# ── AI client ─────────────────────────────────────────────────────────────────
 
 class AIClient:
     def __init__(self, cfg):
@@ -87,8 +74,6 @@ class AIClient:
             from groq import Groq
             self.groq       = Groq(api_key=cfg["ai"]["groq_api_key"])
             self.model_name = cfg["ai"].get("groq_model", "llama-3.3-70b-versatile")
-            # Stay safely under the 30 RPM free-tier limit.
-            # groq_rpm: 25  →  60/25 = 2.4s minimum gap between calls.
             rpm              = cfg["ai"].get("groq_rpm", 25)
             self._groq_delay = 60.0 / rpm
             log.info(f"AI: Groq · {self.model_name} · {rpm} RPM (delay {self._groq_delay:.1f}s)")
@@ -111,8 +96,6 @@ class AIClient:
                         max_tokens=2000,
                         temperature=0.3,
                     )
-                    # Enforce minimum gap between requests regardless of how
-                    # fast the model responds — keeps us under the RPM cap.
                     time.sleep(self._groq_delay)
                     return resp.choices[0].message.content
 
@@ -120,40 +103,14 @@ class AIClient:
                     err = str(e).lower()
                     is_rate_limit = "rate_limit" in err or "429" in err or "too many" in err
                     if is_rate_limit and attempt < max_retries - 1:
-                        wait = 10 * (2 ** attempt)   # 10s → 20s → 40s
+                        wait = 10 * (2 ** attempt)
                         log.warning(f"Groq rate limit hit — waiting {wait}s (attempt {attempt + 1}/{max_retries})")
                         time.sleep(wait)
                     else:
                         raise
 
 
-# ── Repo state checks ─────────────────────────────────────────────────────────
-
-def repo_status(repo):
-    """
-    Returns one of:
-      'empty'     — repo exists but has zero commits / no default branch
-      'active'    — last commit is within inactive_days
-      'inactive'  — last commit older than inactive_days  ← we process these
-    """
-    try:
-        branch = repo.default_branch
-        if not branch:
-            return "empty"
-        commits = repo.get_commits()
-        last = commits.totalCount   # triggers the actual API call
-        if last == 0:
-            return "empty"
-        dt = commits[0].commit.committer.date
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except GithubException:
-        return "empty"
-
-
 def is_inactive(repo, inactive_days: int):
-    """Returns (True, last_date) if inactive, (False, last_date) if active, (None, None) if empty."""
     try:
         commits = repo.get_commits()
         if commits.totalCount == 0:
@@ -167,17 +124,63 @@ def is_inactive(repo, inactive_days: int):
         return None, None
 
 
-def has_readme(repo):
-    for name in ("README.md", "readme.md", "Readme.md"):
-        try:
-            repo.get_contents(name)
-            return True
-        except GithubException:
-            pass
+def _is_stub_readme(content: str, repo_name: str) -> bool:
+    """
+    True if the README is essentially meaningless — just a title or repo name.
+    Checks both length (under 30 words) AND that it looks like a stub
+    (single heading, matches repo name, or is a single short line).
+    """
+    stripped = content.strip()
+    words = stripped.split()
+
+    if len(words) >= 30:
+        return False  # long enough to be real content
+
+    # Normalise for comparison: lowercase, drop hyphens/underscores
+    def normalise(s):
+        return s.lower().replace("-", "").replace("_", "").replace(" ", "")
+
+    lines = [l.strip() for l in stripped.splitlines() if l.strip()]
+    repo_norm = normalise(repo_name)
+
+    # Single line (possibly a markdown heading)
+    if len(lines) <= 1:
+        return True
+
+    # All non-empty lines are short and at least one matches the repo name
+    all_short = all(len(l) < 60 for l in lines)
+    any_matches_repo = any(repo_norm in normalise(l) for l in lines)
+    if all_short and any_matches_repo:
+        return True
+
+    # Looks like just headings (every line starts with #)
+    if all(l.startswith("#") for l in lines):
+        return True
+
     return False
 
 
-# ── File collection with hard limits ─────────────────────────────────────────
+def get_readme_state(repo):
+    """
+    Returns:
+      ('missing', None)   — no README file at all
+      ('empty', sha)      — README exists but is blank/whitespace
+      ('stub', sha)       — README has content but it's just a title/repo name
+      ('ok', sha)         — README exists and has real content
+    """
+    for name in ("README.md", "readme.md", "Readme.md"):
+        try:
+            f = repo.get_contents(name)
+            content = f.decoded_content.decode("utf-8", errors="ignore").strip()
+            if content == "":
+                return "empty", f.sha
+            if _is_stub_readme(content, repo.name):
+                return "stub", f.sha
+            return "ok", f.sha
+        except GithubException:
+            pass
+    return "missing", None
+
 
 def collect_files(repo, cfg_scanner: dict):
     max_file_chars  = cfg_scanner.get("max_file_chars", 2500)
@@ -218,11 +221,9 @@ def collect_files(repo, cfg_scanner: dict):
                 name = item.name
                 ext  = os.path.splitext(name)[1].lower()
 
-                # Hard skip list
                 if ext in SKIP_EXTENSIONS:
                     continue
 
-                # Size guard — skip files over the KB limit
                 if item.size > max_file_kb * 1024:
                     skipped_large += 1
                     log.debug(f"  skip large file: {item.path} ({item.size // 1024}KB)")
@@ -231,7 +232,6 @@ def collect_files(repo, cfg_scanner: dict):
                 if ext in CODE_EXTENSIONS:
                     try:
                         content = item.decoded_content.decode("utf-8", errors="ignore")
-                        # Trim to per-file char cap
                         if len(content) > max_file_chars:
                             content = content[:max_file_chars] + "\n# ... truncated"
                         entry = (item.path, content)
@@ -255,8 +255,6 @@ def build_code_block(files: dict) -> str:
     ordered = files["priority"] + files["normal"]
     return "\n\n".join(f"### {path}\n```\n{content}\n```" for path, content in ordered)
 
-
-# ── AI analysis ───────────────────────────────────────────────────────────────
 
 def analyze_repo(ai: AIClient, repo_name: str, files: dict) -> dict:
     code_block = build_code_block(files)
@@ -282,42 +280,72 @@ The README must include: project name, what it does, key features, tech stack, i
     return json.loads(raw)
 
 
-# ── Per-repo logic ────────────────────────────────────────────────────────────
-
-def process_repo(repo, ai: AIClient, cfg: dict):
-    s             = cfg.get("scanner", {})
-    dry_run       = s.get("dry_run", False)
+def process_repo(repo, ai: AIClient, cfg: dict, force_recent=False) -> bool:
+    """
+    Process a single repo. Returns True if any update was made.
+    force_recent=True skips the inactive check (used for the recent pass).
+    """
+    s       = cfg.get("scanner", {})
+    dry_run = s.get("dry_run", False)
     overwrite     = s.get("overwrite_readme", False)
     inactive_days = s.get("inactive_days", 30)
 
-    # ── Empty repo ──
-    inactive, last_dt = is_inactive(repo, inactive_days)
+    if not force_recent:
+        inactive, last_dt = is_inactive(repo, inactive_days)
 
-    if inactive is None:
-        log.info(f"  SKIP  {repo.name:<35}  empty repo (no commits)")
-        return
+        if inactive is None:
+            log.info(f"  SKIP  {repo.name:<35}  empty repo (no commits)")
+            return False
 
-    # ── Active repo ──
-    if not inactive:
-        log.info(f"  SKIP  {repo.name:<35}  active ({last_dt.strftime('%Y-%m-%d')})")
-        return
+        if not inactive:
+            log.info(f"  SKIP  {repo.name:<35}  active ({last_dt.strftime('%Y-%m-%d')})")
+            return False
 
-    # ── Already documented ──
-    needs_desc   = not repo.description
-    needs_readme = overwrite or not has_readme(repo)
+        readme_state, readme_sha = get_readme_state(repo)
+        # stub README → force-rewrite README and sync description
+        needs_desc   = not repo.description or readme_state == "stub"
+        needs_readme = overwrite or readme_state in ("missing", "empty", "stub")
 
-    if not needs_desc and not needs_readme:
-        log.info(f"  SKIP  {repo.name:<35}  already documented")
-        return
+        if not needs_desc and not needs_readme:
+            log.info(f"  SKIP  {repo.name:<35}  already documented")
+            return False
 
-    log.info(f"  SCAN  {repo.name}  (last commit {last_dt.strftime('%Y-%m-%d')})")
+        reasons = []
+        if not repo.description:
+            reasons.append("no description")
+        if readme_state == "stub":
+            reasons.append("stub README")
+        log.info(f"  SCAN  {repo.name}  (last commit {last_dt.strftime('%Y-%m-%d')}"
+                 + (f" · {', '.join(reasons)}" if reasons else "") + ")")
+    else:
+        # Recent pass — check what actually needs doing
+        inactive, last_dt = is_inactive(repo, inactive_days)
+        readme_state, readme_sha = get_readme_state(repo)
+        needs_desc   = not repo.description or readme_state == "stub"
+        needs_readme = readme_state in ("missing", "empty", "stub")
+
+        if not needs_desc and not needs_readme:
+            log.info(f"  SKIP  {repo.name:<35}  already documented (recent)")
+            return False
+
+        reasons = []
+        if not repo.description:
+            reasons.append("no description")
+        if readme_state == "missing":
+            reasons.append("no README")
+        elif readme_state == "empty":
+            reasons.append("empty README")
+        elif readme_state == "stub":
+            reasons.append("stub README")
+
+        log.info(f"  SCAN  {repo.name}  (recent · {', '.join(reasons)})")
 
     files, total = collect_files(repo, s)
     count = len(files["priority"]) + len(files["normal"])
 
     if count == 0:
         log.info(f"        no processable code files — skipping")
-        return
+        return False
 
     log.info(f"        {count} file(s) · {total:,} chars")
 
@@ -325,53 +353,58 @@ def process_repo(repo, ai: AIClient, cfg: dict):
         result = analyze_repo(ai, repo.name, files)
     except json.JSONDecodeError as e:
         log.error(f"        AI returned invalid JSON: {e}")
-        return
+        return False
     except Exception as e:
         log.error(f"        AI error: {e}")
-        return
+        return False
 
     desc   = result.get("description", "")[:255]
     readme = result.get("readme", "")
 
     if not desc and not readme:
         log.warning(f"        AI returned empty result — skipping")
-        return
+        return False
+
+    updated = False
 
     if dry_run:
         log.info(f"        [DRY RUN] desc   → {desc}")
         log.info(f"        [DRY RUN] readme → {readme[:120]}…")
-        return
+        return True
 
     if needs_desc and desc:
         try:
             repo.edit(description=desc)
             log.info(f"        ✓ description set")
+            updated = True
         except Exception as e:
             log.error(f"        description failed: {e}")
 
     if needs_readme and readme:
         try:
-            sha = None
-            for name in ("README.md", "readme.md", "Readme.md"):
-                try:
-                    sha = repo.get_contents(name).sha
-                    break
-                except GithubException:
-                    pass
-
-            if sha and overwrite:
-                repo.update_file("README.md", "docs: update README via repo-scanner", readme, sha)
-                log.info(f"        ✓ README updated")
-            elif not sha:
+            if readme_state in ("empty", "stub") and readme_sha:
+                commit_msg = (
+                    "docs: fill empty README via repo-scanner"
+                    if readme_state == "empty"
+                    else "docs: rewrite stub README via repo-scanner"
+                )
+                repo.update_file("README.md", commit_msg, readme, readme_sha)
+                log.info(f"        ✓ README {'filled' if readme_state == 'empty' else 'rewritten'} (was {readme_state})")
+                updated = True
+            elif readme_state == "missing":
                 repo.create_file("README.md", "docs: add README via repo-scanner", readme)
                 log.info(f"        ✓ README created")
+                updated = True
+            elif overwrite and readme_sha:
+                repo.update_file("README.md", "docs: update README via repo-scanner", readme, readme_sha)
+                log.info(f"        ✓ README updated")
+                updated = True
         except Exception as e:
             log.error(f"        README failed: {e}")
 
     time.sleep(1.5)
+    return updated
 
-
-# ── Full scan ─────────────────────────────────────────────────────────────────
 
 def run_scan(cfg: dict):
     log.info("=" * 55)
@@ -386,29 +419,77 @@ def run_scan(cfg: dict):
     gh       = Github(auth=Auth.Token(token))
     ai       = AIClient(cfg)
     username = gh_cfg.get("username", "").strip()
-    # Fall back to the authenticated token owner if username is blank or still a placeholder
     if username and username != "your_github_username":
         user = gh.get_user(username)
     else:
         user = gh.get_user()
-    repos    = list(user.get_repos(type="owner"))
 
+    repos      = list(user.get_repos(type="owner"))
     skip_forks = cfg.get("scanner", {}).get("skip_forks", True)
+    inactive_days = cfg.get("scanner", {}).get("inactive_days", 30)
+
     log.info(f"Repos: {len(repos)}  skip_forks={skip_forks}")
+
+    # ── Pass 1: inactive repos (30+ days) ────────────────────────────────────
+    log.info("-" * 55)
+    log.info("Pass 1 — inactive repos")
+
+    inactive_updated = 0
 
     for repo in repos:
         if skip_forks and repo.fork:
-            log.info(f"  SKIP  {repo.name:<35}  forked from {repo.parent.full_name if repo.parent else 'unknown'}")
+            log.info(f"  SKIP  {repo.name:<35}  forked")
             continue
         try:
-            process_repo(repo, ai, cfg)
+            did_update = process_repo(repo, ai, cfg, force_recent=False)
+            if did_update:
+                inactive_updated += 1
         except Exception as e:
             log.error(f"  ERROR  {repo.name}: {e}")
 
+    log.info(f"Pass 1 done — {inactive_updated} repo(s) updated")
+
+    # ── Pass 2: recent repos (conditional) ───────────────────────────────────
+    if inactive_updated > 0:
+        log.info("-" * 55)
+        log.info(f"Pass 2 — SKIPPED (Pass 1 updated {inactive_updated} repo(s))")
+        log.info("Scan complete.")
+        return
+
+    log.info("-" * 55)
+    log.info("Pass 2 — recent repos (oldest-first)")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=inactive_days)
+
+    # Collect recent repos with their last-commit date, then sort oldest-first
+    recent = []
+    for repo in repos:
+        if skip_forks and repo.fork:
+            continue
+        try:
+            _, last_dt = is_inactive(repo, inactive_days)
+            if last_dt is None:
+                continue  # empty repo
+            if last_dt >= cutoff:
+                recent.append((last_dt, repo))
+        except Exception as e:
+            log.error(f"  ERROR  {repo.name}: {e}")
+
+    recent.sort(key=lambda x: x[0])  # oldest commit date first
+    log.info(f"Recent repos to check: {len(recent)}")
+
+    recent_updated = 0
+    for last_dt, repo in recent:
+        try:
+            did_update = process_repo(repo, ai, cfg, force_recent=True)
+            if did_update:
+                recent_updated += 1
+        except Exception as e:
+            log.error(f"  ERROR  {repo.name}: {e}")
+
+    log.info(f"Pass 2 done — {recent_updated} repo(s) updated")
     log.info("Scan complete.")
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
