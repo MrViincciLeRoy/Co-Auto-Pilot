@@ -2,7 +2,7 @@ github:
   # Leave token blank — comes from SCANNER_GITHUB_TOKEN secret in GitHub Actions
   # For local runs: set the SCANNER_GITHUB_TOKEN env var, or paste here temporarily
   token: ""
-  username: "your_github_username"   # optional; defaults to token owner
+  username: ""   # leave blank — defaults to the token owner automatically
 
 ai:
   provider: "groq"                   # groq | gemini
