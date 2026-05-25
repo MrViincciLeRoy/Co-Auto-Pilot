@@ -90,16 +90,36 @@ class GroqThrottle:
         self._last_sent = time.monotonic()
 
 
+class _GeminiSlot:
+    __slots__ = ("key", "model", "label", "rl_hits", "dead")
+
+    def __init__(self, key: str, model_name: str, label: str):
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        self.key = key
+        self.model = genai.GenerativeModel(model_name)
+        self.label = label
+        self.rl_hits = 0
+        self.dead = False
+
+    def strike(self) -> bool:
+        self.rl_hits += 1
+        if self.rl_hits >= KEY_RATE_LIMIT_STRIKES:
+            self.dead = True
+        return self.dead
+
+
 class AIClient:
     def __init__(self, cfg):
         self.provider = cfg["ai"]["provider"].lower()
 
         if self.provider == "gemini":
             import google.generativeai as genai
-            genai.configure(api_key=cfg["ai"]["gemini_api_key"])
+            keys = cfg["ai"].get("gemini_keys", [])
             model_name = cfg["ai"].get("gemini_model", "gemini-1.5-flash")
-            self.model = genai.GenerativeModel(model_name)
-            log.info(f"AI: Gemini · {model_name}")
+            self._gemini_slots = [_GeminiSlot(k, model_name, f"key {i+1}") for i, k in enumerate(keys)]
+            self._gemini_cursor = 0
+            log.info(f"AI: Gemini · {model_name} · {len(keys)} key(s)")
 
         elif self.provider == "groq":
             from groq import Groq
@@ -113,6 +133,51 @@ class AIClient:
         else:
             raise ValueError(f"Unknown AI provider '{self.provider}'")
 
+    # ── Gemini helpers ────────────────────────────────────────────────────────
+
+    def _live_gemini_slots(self) -> list:
+        return [s for s in self._gemini_slots if not s.dead]
+
+    def _next_gemini_slot(self) -> _GeminiSlot:
+        live = self._live_gemini_slots()
+        if not live:
+            raise AllKeysDead(f"All {len(self._gemini_slots)} Gemini key(s) exhausted.")
+        slot = live[self._gemini_cursor % len(live)]
+        self._gemini_cursor += 1
+        return slot
+
+    def _generate_gemini(self, prompt: str) -> str:
+        max_attempts = len(self._gemini_slots) * KEY_RATE_LIMIT_STRIKES
+
+        for _ in range(max_attempts):
+            slot = self._next_gemini_slot()
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=slot.key)
+                resp = slot.model.generate_content(prompt)
+                return resp.text
+
+            except Exception as e:
+                err = str(e).lower()
+                is_rate_limit = "429" in err or "resource_exhausted" in err or "quota" in err or "too many" in err
+
+                if is_rate_limit:
+                    just_died = slot.strike()
+                    live_count = len(self._live_gemini_slots())
+                    if just_died:
+                        log.warning(f"        Gemini {slot.label} marked dead. {live_count} key(s) remaining.")
+                    else:
+                        log.warning(f"        Gemini {slot.label} rate limit ({slot.rl_hits}/{KEY_RATE_LIMIT_STRIKES} strikes). {live_count} live.")
+                    if live_count == 0:
+                        raise AllKeysDead(f"All {len(self._gemini_slots)} Gemini key(s) exhausted.")
+                    time.sleep(60.0)
+                    continue
+                raise
+
+        raise RuntimeError(f"Gemini: exhausted {max_attempts} attempts")
+
+    # ── Groq helpers ──────────────────────────────────────────────────────────
+
     def _live_slots(self) -> list:
         return [s for s in self._slots if not s.dead]
 
@@ -124,10 +189,7 @@ class AIClient:
         self._cursor += 1
         return slot
 
-    def generate(self, prompt: str) -> str:
-        if self.provider == "gemini":
-            return self.model.generate_content(prompt).text
-
+    def _generate_groq(self, prompt: str) -> str:
         estimated_tokens = len(prompt) // 2
         self._throttle.before(estimated_tokens)
         max_attempts = len(self._slots) * KEY_RATE_LIMIT_STRIKES
@@ -165,3 +227,10 @@ class AIClient:
                 raise
 
         raise RuntimeError(f"Groq: exhausted {max_attempts} attempts")
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def generate(self, prompt: str) -> str:
+        if self.provider == "gemini":
+            return self._generate_gemini(prompt)
+        return self._generate_groq(prompt)
