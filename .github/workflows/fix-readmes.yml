@@ -1,19 +1,21 @@
-name: Repo Scanner
+name: Fix Broken READMEs
 
 on:
-  schedule:
-    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Dry run — log everything, push nothing"
         type: boolean
-        default: false
+        default: true
+      skip_repo:
+        description: "Repo name to skip (this repo — case sensitive)"
+        type: string
+        default: "CAP"
 
 jobs:
-  scan:
+  fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -28,12 +30,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scanner
+      - name: Fix broken READMEs
         run: |
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            python main.py --config config.yaml --dry-run
+            python fix_broken_readmes.py --config config.yaml --dry-run --skip-repo "${{ github.event.inputs.skip_repo }}"
           else
-            python main.py --config config.yaml
+            python fix_broken_readmes.py --config config.yaml --skip-repo "${{ github.event.inputs.skip_repo }}"
           fi
         env:
           SCANNER_GITHUB_TOKEN: ${{ secrets.SCANNER_GITHUB_TOKEN }}
