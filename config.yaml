@@ -1,0 +1,31 @@
+github:
+  # Leave token blank — comes from SCANNER_GITHUB_TOKEN secret in GitHub Actions
+  # For local runs: set the SCANNER_GITHUB_TOKEN env var, or paste here temporarily
+  token: ""
+  username: "your_github_username"   # optional; defaults to token owner
+
+ai:
+  provider: "groq"                   # groq | gemini
+
+  # Keys come from GitHub Actions secrets (GROQ_API_KEY / GEMINI_API_KEY)
+  # For local runs set those env vars, or paste here temporarily
+  groq_api_key: ""
+  groq_model: "llama-3.3-70b-versatile"
+  # groq_model: "deepseek-r1-distill-llama-70b"   # stronger, slower
+
+  gemini_api_key: ""
+  gemini_model: "gemini-1.5-flash"
+
+scanner:
+  inactive_days: 30         # skip repos that had a commit within this many days
+
+  # ── Context / size limits ──────────────────────────────────────────────
+  max_file_size_kb: 60      # skip any single file larger than this (KB)
+  max_file_chars: 2500      # chars to keep per file after loading
+  max_total_chars: 50000    # hard cap on total chars sent to the model
+  max_files: 40             # max number of files to collect per repo
+
+  # ── Behaviour ──────────────────────────────────────────────────────────
+  skip_forks: true          # ignore repos forked from others
+  overwrite_readme: false   # true = overwrite existing READMEs too
+  dry_run: false            # true = log everything but push nothing
