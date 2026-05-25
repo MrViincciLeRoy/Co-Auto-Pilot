@@ -155,7 +155,10 @@ class AIClient:
                 import google.generativeai as genai
                 genai.configure(api_key=slot.key)
                 resp = slot.model.generate_content(prompt)
-                return resp.text
+                content = resp.text
+                if not content or not content.strip():
+                    raise ValueError("Gemini returned empty content")
+                return content
 
             except Exception as e:
                 err = str(e).lower()
@@ -205,7 +208,10 @@ class AIClient:
                 )
                 tokens_used = resp.usage.total_tokens if resp.usage else estimated_tokens
                 self._throttle.after_success(tokens_used)
-                return resp.choices[0].message.content
+                content = resp.choices[0].message.content
+                if not content or not content.strip():
+                    raise ValueError("Groq returned empty content")
+                return content
 
             except Exception as e:
                 err = str(e).lower()

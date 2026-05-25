@@ -17,6 +17,42 @@ def _truncate_prompt(code_block: str, limit: int) -> str:
     return truncated + "\n\n# ... context trimmed to fit model limit"
 
 
+def _fix_readme(text: str) -> str:
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n")
+    if "\\t" in text:
+        text = text.replace("\\t", "\t")
+    return text.strip()
+
+
+def _parse_response(raw: str) -> dict:
+    if not raw:
+        raise ValueError("AI returned empty response")
+
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
+
+    if not raw:
+        raise ValueError("AI returned empty response after stripping fences")
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            log.warning(f"        raw response (first 500 chars): {raw[:500]}")
+            raise e
+
+    if "readme" in result:
+        result["readme"] = _fix_readme(result["readme"])
+
+    return result
+
+
 def analyze_repo(ai: AIClient, repo_name: str, files: dict) -> dict:
     code_block = build_code_block(files)
     prompt_limit = GROQ_MAX_PROMPT_CHARS - 500
@@ -34,11 +70,14 @@ def analyze_repo(ai: AIClient, repo_name: str, files: dict) -> dict:
 Return ONLY valid JSON — no markdown fences, no preamble — shaped exactly like:
 {{
   "description": "One sentence max 200 chars describing what this project does",
-  "readme": "Full markdown README content"
+  "readme": "Full markdown README content here"
 }}
 
-The README must include: project name, what it does, key features, tech stack, installation, usage, and required env vars if any.
-IMPORTANT: In the readme value, escape all backslashes as \\\\ and do not use raw backslashes."""
+Rules:
+- The readme value must be a valid JSON string with real newlines escaped as \\n
+- Use proper markdown: # headings, ## sections, ``` code blocks, bullet lists with -
+- Include: project name, what it does, key features, tech stack, installation, usage, env vars
+- Do not include the outer JSON structure inside the readme value itself"""
 
     try:
         raw = ai.generate(prompt).strip()
@@ -48,12 +87,8 @@ IMPORTANT: In the readme value, escape all backslashes as \\\\ and do not use ra
         log.error(f"        AI error: {e}")
         return {}
 
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
-
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
-        return json.loads(cleaned)
+        return _parse_response(raw)
+    except Exception as e:
+        log.error(f"        Failed to parse AI response: {e}")
+        return {}
