@@ -2,8 +2,8 @@ name: Repo Scanner
 
 on:
   schedule:
-    - cron: "0 3 * * *"   # every day at 03:00 UTC
-  workflow_dispatch:        # allow manual trigger from GitHub UI
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -26,7 +26,12 @@ jobs:
       - name: Run scanner
         run: python main.py --config config.yaml
         env:
-          # Store these in:  Settings → Secrets and variables → Actions
           SCANNER_GITHUB_TOKEN: ${{ secrets.SCANNER_GITHUB_TOKEN }}
-          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
-          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          # Add as many Groq keys as you want: GROQ_API_KEY_1, GROQ_API_KEY_2, ...
+          # The scanner rotates through them automatically on rate limits.
+          GROQ_API_KEY_1:       ${{ secrets.GROQ_API_KEY_1 }}
+          GROQ_API_KEY_2:       ${{ secrets.GROQ_API_KEY_2 }}
+          GROQ_API_KEY_3:       ${{ secrets.GROQ_API_KEY_3 }}
+          #GROQ_API_KEY_4:       ${{ secrets.GROQ_API_KEY_4 }}
+          #GROQ_API_KEY_5:       ${{ secrets.GROQ_API_KEY_5 }}
+          #GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
